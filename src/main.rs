@@ -2,6 +2,10 @@ use std::{vec, fs::File, io::Write, path::Path};
 
 use rand::{Rng, rngs::ThreadRng};
 
+struct Edge {
+    
+}
+
 #[derive(Debug)]
 struct Graph {
     N: usize,
@@ -52,7 +56,7 @@ impl Graph {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Partition {
     None, Id(usize)
 }
@@ -65,48 +69,26 @@ struct PartitioningDetails {
 }
 
 struct Partitioning<'a> {
-    color: Vec<Partition>,
+    node_partition: Vec<Partition>,
     graph: &'a Graph,
     details: PartitioningDetails
 }
 
 impl<'a> Partitioning<'a> {
     
-    fn new_empty(g:&'a Graph) -> Self {
-        Partitioning { 
-            color: vec![Partition::None; g.N], 
+    fn new_random(npart:usize, g:&'a Graph) -> Self {
+        let n_per_partition = g.N / npart;
+        let mut random_hat : Vec<usize> = (0..g.N).collect();
+        let mut partitions = Partitioning { 
+            node_partition: vec![Partition::None; g.N], 
             graph: g,
             details: PartitioningDetails { 
-                load_imbalance: f32::MAX, 
+                load_imbalance: 0., 
                 ncut: 0, 
                 cut_cost: 0. 
             }
-        }
-    }
-    
-    fn set(&mut self, i: usize, id: Partition) {
-        self.color[i] = id;
-    }
+        };
 
-    fn swap(&mut self, i: usize, j: usize) -> &PartitioningDetails{
-        self.color.swap(i, j);
-        
-        &self.details
-    }
-
-}
-
-trait PartitioningStrategy {
-    fn run<'a>(&'a self, npart: usize, g: &'a Graph) -> Partitioning;
-    
-}
-
-struct RandomAssignation;
-impl PartitioningStrategy for RandomAssignation {
-    fn run<'a>(&'a self, npart: usize, g: &'a Graph) -> Partitioning {
-        let n_per_partition = g.N / npart;
-        let mut random_hat : Vec<usize> = (0..g.N).collect();
-        let mut partitions = Partitioning::new_empty(g);
         let mut rng = rand::thread_rng();
 
         // for each p part
@@ -114,7 +96,7 @@ impl PartitioningStrategy for RandomAssignation {
             // take out n_per_partition node randomly and assign them id(i)
             for j in 0..n_per_partition {
                 let candidate_index = rng.gen_range(0..random_hat.len());
-                partitions.set(random_hat[candidate_index], Partition::Id(p));
+                partitions.assign(random_hat[candidate_index], Partition::Id(p));
                 random_hat.swap_remove(candidate_index);
             }
         }
@@ -122,6 +104,25 @@ impl PartitioningStrategy for RandomAssignation {
         assert!(random_hat.is_empty());
         partitions
     }
+    
+    fn assign(&mut self, i: usize, id: Partition) -> &PartitioningDetails {
+        self.node_partition[i] = id;
+        
+        &self.details
+    }
+
+    fn swap(&mut self, i: usize, j: usize) -> &PartitioningDetails {
+        self.node_partition.swap(i, j);
+        
+        // fast update details via differential computing
+
+        &self.details
+    }
+
+}
+
+trait PartitioningStrategy {
+    fn run<'a>(&'a self, npart: usize, g: &'a Graph) -> Partitioning;
 }
 
 
@@ -168,7 +169,6 @@ fn export_as_csv(folder: &Path, partitioning: &Partitioning) -> std::io::Result<
 
 fn main() {
     let graph = Graph::new_randomized(100);
-    let partitioner = RandomAssignation{};
-    let part = partitioner.run(4, &graph);
+    let part = Partitioning::new_random(4, &graph);
     export_as_csv(Path::new("/tmp/"), &part).unwrap();
 }
