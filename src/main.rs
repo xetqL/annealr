@@ -1,5 +1,5 @@
 use core::panic;
-use std::{vec, fs::File, io::Write, path::Path};
+use std::{vec, fs::File, io::Write, path::Path, thread::current};
 use rand::{Rng, rngs::ThreadRng};
 
 #[derive(Debug)]
@@ -72,12 +72,25 @@ struct PartitioningStatistics {
     cut_cost: f32,
     // ... other metric can be implemented here ... 
 }
-
+#[derive(Clone)]
 struct Partitioning<'a> {
     n_part: usize,
     vertex_partition: Vec<Partition>,
     graph: &'a Graph,
     details: PartitioningStatistics
+}   
+
+fn load_imbalance(load_per_partition: &[f32]) ->f32 {
+    let max = load_per_partition.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap().clone();
+    let mean : f32 = (load_per_partition.iter().sum::<f32>()) / load_per_partition.len() as f32;
+    return max / mean;
+}
+
+fn variance(load_per_partition: &[f32]) ->f32 {
+    let mean_of_squares = load_per_partition.iter().fold(0f32, |acc, v| acc + v*v) / load_per_partition.len() as f32;
+    let mean : f32 = (load_per_partition.iter().sum::<f32>()) / load_per_partition.len() as f32;
+    
+    return mean_of_squares - (mean*mean);
 }
 
 fn compute_cut_contribution(vertices: &[usize], partitioning: &Partitioning) -> f32 {
@@ -94,35 +107,6 @@ fn compute_cut_contribution(vertices: &[usize], partitioning: &Partitioning) -> 
 }
 
 impl<'a> Partitioning<'a> {
-
-    fn full_compute_statistics(mut self) -> Self {
-        
-        let mut load_per_partition = vec![0.; self.n_part];
-        let mut ncut : usize = 0;
-        let mut cut_cost: f32 = 0.;
-        
-        for (ivertex, wvertex) in self.graph.vertex_weight.iter().enumerate() {
-            match self.vertex_partition[ivertex] {
-                Partition::Id(id) => {
-                    load_per_partition[id] += wvertex;
-                    for (ineighbor, neighbor_edge_weight) in self.graph.edge_weight[ivertex].iter().skip(ivertex).enumerate() {
-                        if neighbor_edge_weight > &0f32 && self.vertex_partition[ineighbor] == self.vertex_partition[ivertex] {
-                            ncut += 1;
-                            cut_cost += neighbor_edge_weight;
-                        }
-                    }
-                },
-                Partition::None => continue
-            }
-        }
-
-        self.details.load_per_partition = load_per_partition;
-        self.details.ncut = ncut;
-        self.details.cut_cost = cut_cost;
-
-        self
-    }
-
     fn new_random(npart:usize, g:&'a Graph) -> Self {
         let n_per_partition = g.N / npart;
         let mut random_hat : Vec<usize> = (0..g.N).collect();
@@ -151,40 +135,98 @@ impl<'a> Partitioning<'a> {
 
     }
 
-    fn new_simulated_annealing<Fitness: Fn(&Partitioning, &Graph) -> f32>(npart: usize, graph: &'a Graph, initial_temp: f32, fitness: Fitness) 
-        -> Self {
-        let current_solution = Partitioning::new_random(npart, graph);
+    fn assign_partition(&mut self, i: usize, partition: Partition) {
+        let contrib = compute_cut_contribution(&[i], self);
+        self.details.cut_cost -= contrib;
+        self.vertex_partition[i] = partition;
+        let contrib = compute_cut_contribution(&[i], self);
+        self.details.cut_cost += contrib;
+    }
+
+    fn new_simulated_annealing<'b: 'a, Move: Fn(&Partitioning<'a>) -> Partitioning<'b>, Fitness: Fn(&Partitioning) -> f32> (n_part: usize, graph: &'b Graph, cooling: f32, random_neighbor: Move, fitness: Fitness) -> Partitioning<'a> {
+        const INITIAL_ACCEPTANCE_PROBABILITY : f32 = 0.5;
+        const N_ITER_BOOTSTRAP : usize = 100;
+
+        assert!(0f32 < cooling && cooling < 1f32);
+        // bootstrap
         
-        let current_fitness = fitness(&current_solution, graph);
+        let initial_solution = Partitioning::new_random(n_part, graph);
+        
+        let mut current_solution = initial_solution;
+        let mut bootstrap_energies = [0f32; N_ITER_BOOTSTRAP];
+        
+        for i in 0..N_ITER_BOOTSTRAP {
+            let next_solution = random_neighbor(&current_solution);
+            bootstrap_energies[i] = fitness(&current_solution);
+            current_solution = next_solution;
+        } 
+
+        let average_energy : f32 = bootstrap_energies.iter().sum::<f32>() / N_ITER_BOOTSTRAP as f32;
+
+        let decrease_threshold_on_accept = 12 * graph.N as u32;
+        let decrease_threshold_on_tried  =100 * graph.N as u32;
+        let stop_after_step_not_improving = 3;
+
         let mut rng = rand::thread_rng();
-        
-        let i = rng.gen_range(0..=graph.N);
-        let j = rng.gen_range(0..=graph.N);
-
-        let next_solution = current_solution.swap(i, j);
-        let next_fitness = fitness(&current_solution, graph);
-
-        let current_solution = if next_fitness < current_fitness {next_solution} else {current_solution}
+        let mut temperature = -average_energy / f32::ln(INITIAL_ACCEPTANCE_PROBABILITY);
+        let mut n_accept = 0u32;
+        let mut n_iter = 0u32;
+        let mut n_not_improving_step = 0u32;
+        let mut current_fitness = fitness(&current_solution);
+        println!("Current fitness: {}\tTemperature: {}", current_fitness, temperature);
+        while n_not_improving_step < stop_after_step_not_improving {
+            let next_solution = random_neighbor(&current_solution);
+            let next_fitness = fitness(&current_solution);
+            n_iter += 1;
+            
+            current_solution = if rng.gen_range(0f32..1f32) < f32::exp(-(next_fitness-current_fitness) / temperature) {
+                println!("accepted");
+                n_accept += 1;
+                current_fitness = next_fitness;
+                next_solution
+            } else {
+                current_solution
+            };
+            
+            if n_accept >= decrease_threshold_on_accept || n_iter >= decrease_threshold_on_tried {
+                temperature *= cooling;
+                n_not_improving_step = if n_accept == 0 {n_not_improving_step + 1} else {0};
+                n_accept = 0;
+                n_iter = 0;
+                println!("Current fitness: {}\tTemperature: {}", current_fitness, temperature);
+            }
+        }
 
         current_solution
     }
 
-    fn swap(&'a self, i:usize, j:usize) -> Self {
-        let mut new_part = Partitioning { 
-            n_part: self.n_part, 
-            vertex_partition: self.vertex_partition.clone(), 
-            graph: self.graph, 
-            details: self.details.clone() 
-        };
-        
-        // update cut cost
-        let contrib = compute_cut_contribution(&[i, j], &new_part);
-        new_part.details.cut_cost -= contrib;
-        new_part.vertex_partition.swap(i, j);
-        let contrib = compute_cut_contribution(&[i, j], &new_part);
-        new_part.details.cut_cost += contrib;
 
-        new_part
+    fn full_compute_statistics(mut self) -> Self {
+        
+        let mut load_per_partition = vec![0.; self.n_part];
+        let mut ncut : usize = 0;
+        let mut cut_cost: f32 = 0.;
+        
+        for (ivertex, wvertex) in self.graph.vertex_weight.iter().enumerate() {
+            match self.vertex_partition[ivertex] {
+                Partition::Id(id) => {
+                    load_per_partition[id] += wvertex;
+                    for (ineighbor, neighbor_edge_weight) in self.graph.edge_weight[ivertex].iter().skip(ivertex).enumerate() {
+                        if neighbor_edge_weight > &0f32 && self.vertex_partition[ineighbor] == self.vertex_partition[ivertex] {
+                            ncut += 1;
+                            cut_cost += neighbor_edge_weight;
+                        }
+                    }
+                },
+                Partition::None => continue
+            }
+        }
+
+        self.details.load_per_partition = load_per_partition;
+        self.details.ncut = ncut;
+        self.details.cut_cost = cut_cost;
+
+        self
     }
 
 }
@@ -218,8 +260,22 @@ fn export_as_csv(folder: &Path, partitioning: &Partitioning) -> std::io::Result<
     Ok(())
 }
 
+fn neighbor<'a>(part: &Partitioning<'a>) -> Partitioning<'a> {
+    let mut neighbor: Partitioning<'a> = part.clone();
+    neighbor.assign_partition(rand::thread_rng().gen_range(0..part.graph.N), Partition::Id(rand::thread_rng().gen_range(0..part.n_part)));
+    neighbor
+}
+
+fn fitness_functor (alpha:f32) -> impl Fn(&Partitioning) -> f32 {
+    move |part:&Partitioning| alpha * (1f32 + variance(&part.details.load_per_partition))
+}
+
 fn main() {
     let graph = Graph::new_randomized(100);
-    let part = Partitioning::new_random(4, &graph);
+    let part = Partitioning::new_simulated_annealing(4, &graph, 
+        0.9f32, 
+        neighbor,
+        fitness_functor(1.15f32));
+        
     export_as_csv(Path::new("/tmp/"), &part).unwrap();
 }
