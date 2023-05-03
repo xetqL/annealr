@@ -146,8 +146,8 @@ impl From<File> for Graph<Rc<RefCell<PartitionGridPoint>>> {
                 match i_to_xy_colwise_nodiag(i, n_elements) {
 
                     Ok((x, y)) => { // connect x and y
-                        elements[x].connect(elements[y]);
-                        elements.get_mut(y).unwrap().connect(elements.get(x).unwrap());
+                        elements[x].connect(elements[y].clone());
+                        elements[y].connect(elements[x].clone());
                     }
 
                     _ => panic!("algorithmic problem in i_to_xy")
@@ -163,35 +163,40 @@ impl From<File> for Graph<Rc<RefCell<PartitionGridPoint>>> {
     }
 }
 
-struct ContiguousPartition<'a> {
+struct ContiguousPartition {
     frontier: Vec<usize>,
     body:     Vec<usize>,
 
     points: Vec<Rc<RefCell<PartitionGridPoint>>>,
-    iter: Iter<'a, &'a Rc<RefCell<PartitionGridPoint>>>
+    iter: Iter<'_, Rc<RefCell<PartitionGridPoint>>>
 }
 
-impl<'a> ContiguousPartition<'a> {
+impl ContiguousPartition {
     fn new() -> Self {
-        let points = Vec::new();
+        let points : Vec<Rc<RefCell<PartitionGridPoint>>> = Vec::new();
         Self { frontier: Vec::new(), body: Vec::new(), iter: points.iter(), points }
+    }
+
+    fn set_points(&mut self, points: &[Rc<RefCell<PartitionGridPoint>>]){
+        self.points.extend_from_slice(points);
+
+        self.frontier = self.points.iter().filter(|p| p.borrow().neighbors.)
+
     }
 }
 
-impl<'a> Iterator for ContiguousPartition<'a> {
-    type Item = &'a Rc<RefCell<PartitionGridPoint>>;
+impl Iterator for ContiguousPartition {
+    type Item = Rc<RefCell<PartitionGridPoint>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().copied()
     }
 }
 
-impl ExactSizeIterator for ContiguousPartition<'_> {
-
-}
+impl ExactSizeIterator for ContiguousPartition {}
 
 struct LBSolution<'a, const NPartitions: usize> {
-    partitions: [ContiguousPartition<'a>; NPartitions],
+    partitions: [ContiguousPartition; NPartitions],
     problem_data: &'a Graph<Rc<RefCell<PartitionGridPoint>>>
 }
 
@@ -229,13 +234,13 @@ impl<'a, const NPartitions: usize> LBSolution<'a, NPartitions> {
                     bounds_y: MinMax(min_block_y, min_block_y+height_per_block),
                 };
 
-                ContiguousPartition::new(problem_data.elements.iter().filter(|p| within(block, p.borrow().x, p.borrow().y)).map(|p|p.clone()).collect());
+                ContiguousPartition::new();
             }
         }
 
         Self {
             problem_data,
-            partitions: [ContiguousPartition<'a>; NPartitions]
+            partitions: [ContiguousPartition; NPartitions]
         }
     }
 }
