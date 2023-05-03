@@ -1,281 +1,256 @@
-use core::panic;
-use std::{vec, fs::File, io::Write, path::Path, thread::current};
-use rand::{Rng, rngs::ThreadRng};
+#![feature(file_create_new)]
+#![feature(vec_push_within_capacity)]
 
-#[derive(Debug)]
-struct Graph {
-    N: usize,
-    adj: Vec<Vec<i32>>,
-    edge_weight: Vec<Vec<f32>>,
-    vertex_weight: Vec<f32>
+use std::{fs::File, path::Path};
+use std::fmt::Display;
+use std::io::Write;
+use clap::ArgMatches;
+use rand::{Rng};
+use tsp::{TSPProblem, TSPSolution, save, Swap, TwoOptSwap};
+use solution::{HasFitness, HasNext, HasPrev, HasSize};
+
+pub mod solution;
+pub mod utils;
+pub mod tsp;
+mod balancing;
+pub mod point;
+
+
+#[derive(PartialEq, Copy, Clone)]
+#[repr(u8)]
+enum ExportPace {None=0b00, AtCooling=0b01, AtIter=0b10, All=0b11}
+
+fn accept_export(pace: u8, event: u8) -> bool {
+    match event {
+        0b00 => true,
+        e => (e & pace)  != 0,
+    }
 }
 
-fn rand_adjacency(N: usize, rng: &mut ThreadRng) -> Vec<Vec<i32>> { 
-    let mut arr = vec![ vec![0; N]; N];
-    for i in 0..N {
-        for j in 0..N {
-            arr[i][j] = rng.gen_range(0..=1)
-        }
-        arr[i][i] = 0;   
-    }
-    arr
-}
+impl TryFrom<u8> for ExportPace {
+    type Error = ();
 
-impl Graph {
-    fn new_null(N: usize) -> Self {
-        Graph { N, adj:vec![ vec![0; N]; N], edge_weight:vec![ vec![0. as f32; N]; N], vertex_weight:vec![0. as f32; N], }
-    }
-
-    fn new_randomized(N: usize) -> Self {
-        let mut rng = rand::thread_rng();
-        let adj  = rand_adjacency(N, &mut rng);
-        let mut edge : Vec<Vec<f32>> = vec![ vec![0.0; N]; N];
-
-        for i in 0..N {
-            for j in 0..N {
-                if adj[i][j] > 0 {
-                    edge[i][j] = rng.gen(); 
-                }
-            }
-        }
-
-        let mut vertex: Vec<f32> = vec![0.0; N];
-        rng.fill(&mut vertex[..]); 
-        Graph { 
-            N, 
-            adj, 
-            edge_weight: edge, 
-            vertex_weight: vertex, 
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0b00 => Ok(ExportPace::None),
+            0b01 => Ok(ExportPace::AtCooling),
+            0b10 => Ok(ExportPace::AtIter),
+            0b11 => Ok(ExportPace::All),
+            _ => Err(())
         }
     }
-
-    fn new_grid<F>(grid_size: usize, ) -> Self {
-        todo!()
-    }
-
-    fn import_from_file(path: &Path) -> Self{
-        todo!()
-    }
-
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum Partition {
-    None, Id(usize)
+#[derive(PartialEq)]
+#[repr(u8)]
+enum ExportEvent { Init=0, Cooling=ExportPace::AtCooling as u8, NewIter=ExportPace::AtIter as u8}
+
+#[derive(Debug, Clone)]
+struct ExportError;
+trait Exporter {
+    fn export<D: Display>(&mut self, display: &D, event: ExportEvent) -> Option<Result<(), ExportError>>;
 }
 
-#[derive(Clone)]
-struct PartitioningStatistics {
-    //load_imbalance: f32,
-    load_per_partition: Vec<f32>,
-    ncut: usize,
-    cut_cost: f32,
-    // ... other metric can be implemented here ... 
+struct StdioExporter {
+    pace: ExportPace
 }
-#[derive(Clone)]
-struct Partitioning<'a> {
-    n_part: usize,
-    vertex_partition: Vec<Partition>,
-    graph: &'a Graph,
-    details: PartitioningStatistics
-}   
-
-fn load_imbalance(load_per_partition: &[f32]) ->f32 {
-    let max = load_per_partition.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap().clone();
-    let mean : f32 = (load_per_partition.iter().sum::<f32>()) / load_per_partition.len() as f32;
-    return max / mean;
-}
-
-fn variance(load_per_partition: &[f32]) ->f32 {
-    let mean_of_squares = load_per_partition.iter().fold(0f32, |acc, v| acc + v*v) / load_per_partition.len() as f32;
-    let mean : f32 = (load_per_partition.iter().sum::<f32>()) / load_per_partition.len() as f32;
-    
-    return mean_of_squares - (mean*mean);
-}
-
-fn compute_cut_contribution(vertices: &[usize], partitioning: &Partitioning) -> f32 {
-    let mut cut_cost = 0f32;
-    for ivertex in vertices {
-        let pvertex = &partitioning.vertex_partition[*ivertex];
-        for (ineighbor, neighbor_edge_weight) in partitioning.graph.edge_weight[*ivertex].iter().enumerate() {
-            if neighbor_edge_weight > &0f32 && &partitioning.vertex_partition[ineighbor] == pvertex {
-                cut_cost += neighbor_edge_weight;
-            }
+impl Exporter for StdioExporter {
+    fn export<D: Display>(&mut self, display: &D, event: ExportEvent) -> Option<Result<(), ExportError>> {
+        if accept_export(self.pace.clone() as u8, event as u8) {
+            Some(Ok(println!("Export: {}", display)))
+        } else {
+            None
         }
     }
-    cut_cost
 }
 
-impl<'a> Partitioning<'a> {
-    fn new_random(npart:usize, g:&'a Graph) -> Self {
-        let n_per_partition = g.N / npart;
-        let mut random_hat : Vec<usize> = (0..g.N).collect();
-        let mut vertex_partition = vec![Partition::None; g.N];
-
-        let mut rng = rand::thread_rng();
-
-        // for each p part
-        for p in 0..npart {
-            // take out n_per_partition node randomly and assign them id(i)
-            for _ in 0..n_per_partition {
-                let candidate_index = rng.gen_range(0..random_hat.len());
-                vertex_partition[random_hat[candidate_index]] = Partition::Id(p);
-                random_hat.swap_remove(candidate_index);
-            }
+struct FileExporter {
+    pace: ExportPace,
+    file: File
+}
+impl FileExporter {
+    pub fn new(path: &Path, pace: ExportPace) -> std::io::Result<Self>{
+        Ok(FileExporter {
+            pace,
+            file: File::create(path)?
+        })
+    }
+}
+impl Exporter for FileExporter {
+    fn export<D: Display>(&mut self, display: &D, event: ExportEvent) -> Option<Result<(), ExportError>> {
+        if accept_export(self.pace.clone() as u8, event as u8) {
+            Some(write!(self.file, "{}", display).map_err(|_| ExportError))
+        } else {
+            None
         }
-        
-        assert!(random_hat.is_empty());
-
-        Partitioning {
-            n_part: npart,
-            vertex_partition,
-            graph: g,
-            details: PartitioningStatistics { load_per_partition: vec![0f32; npart], ncut: 0, cut_cost: 0. }
-        }.full_compute_statistics()
-
     }
+}
 
-    fn assign_partition(&mut self, i: usize, partition: Partition) {
-        let contrib = compute_cut_contribution(&[i], self);
-        self.details.cut_cost -= contrib;
-        self.vertex_partition[i] = partition;
-        let contrib = compute_cut_contribution(&[i], self);
-        self.details.cut_cost += contrib;
+#[derive(Clone, Copy)]
+struct CoolingFactor(f32);
+impl From<CoolingFactor> for f32 {
+    fn from(value: CoolingFactor) -> Self {
+        value.0
     }
+}
 
-    fn new_simulated_annealing<'b: 'a, Move: Fn(&Partitioning<'a>) -> Partitioning<'b>, Fitness: Fn(&Partitioning) -> f32> (n_part: usize, graph: &'b Graph, cooling: f32, random_neighbor: Move, fitness: Fitness) -> Partitioning<'a> {
-        const INITIAL_ACCEPTANCE_PROBABILITY : f32 = 0.5;
-        const N_ITER_BOOTSTRAP : usize = 100;
+#[derive(Debug, Clone)]
+struct RatioBoundError;
 
-        assert!(0f32 < cooling && cooling < 1f32);
-        // bootstrap
-        
-        let initial_solution = Partitioning::new_random(n_part, graph);
-        
-        let mut current_solution = initial_solution;
-        let mut bootstrap_energies = [0f32; N_ITER_BOOTSTRAP];
-        
-        for i in 0..N_ITER_BOOTSTRAP {
-            let next_solution = random_neighbor(&current_solution);
-            bootstrap_energies[i] = fitness(&current_solution);
-            current_solution = next_solution;
-        } 
+impl CoolingFactor {
+    pub fn new(value: f32) -> Result<Self, RatioBoundError>{
+        if 0f32 <= value && value <= 1f32 {
+            Ok(CoolingFactor(value))
+        } else {
+            Err(RatioBoundError)
+        }
+    }
+}
 
-        let average_energy : f32 = bootstrap_energies.iter().sum::<f32>() / N_ITER_BOOTSTRAP as f32;
+fn simulated_annealing<S: HasSize + HasFitness + Display,
+                       N: HasNext<S> + HasPrev<S>,
+                       E: Exporter> (
+        cooling: CoolingFactor,
+        initial_solution: S,
+        strategy: &mut N,
+        exporters: &mut [E]) -> S {
+    const INITIAL_ACCEPTANCE_PROBABILITY : f32 = 0.9;
+    const N_ITER_BOOTSTRAP : usize = 100;
 
-        let decrease_threshold_on_accept = 12 * graph.N as u32;
-        let decrease_threshold_on_tried  =100 * graph.N as u32;
-        let stop_after_step_not_improving = 3;
+    // bootstrap
 
-        let mut rng = rand::thread_rng();
-        let mut temperature = -average_energy / f32::ln(INITIAL_ACCEPTANCE_PROBABILITY);
-        let mut n_accept = 0u32;
-        let mut n_iter = 0u32;
-        let mut n_not_improving_step = 0u32;
-        let mut current_fitness = fitness(&current_solution);
-        println!("Current fitness: {}\tTemperature: {}", current_fitness, temperature);
-        while n_not_improving_step < stop_after_step_not_improving {
-            let next_solution = random_neighbor(&current_solution);
-            let next_fitness = fitness(&current_solution);
-            n_iter += 1;
-            
-            current_solution = if rng.gen_range(0f32..1f32) < f32::exp(-(next_fitness-current_fitness) / temperature) {
-                println!("accepted");
+    let mut current_solution = initial_solution;
+
+    let mut average_energy = 0f32;
+
+    for _ in 0..N_ITER_BOOTSTRAP {
+        let current_fitness = current_solution.fitness();
+        average_energy += (strategy.next(&mut current_solution) - current_fitness) / N_ITER_BOOTSTRAP as f32;
+    } 
+
+    let decrease_threshold_on_accept = 12 * current_solution.size() as u32;
+    let decrease_threshold_on_tried  = 100 * current_solution.size() as u32;
+    let stop_after_step_not_improving = 10;
+
+    let mut rng = rand::thread_rng();
+    let mut temperature = -f32::abs(average_energy) / f32::ln(INITIAL_ACCEPTANCE_PROBABILITY);
+    let mut n_accept = 0u32;
+    let mut n_iter = 0u32;
+    let mut n_not_improving_step = 0u32;
+    let mut best_fitness_step = current_solution.fitness();
+    let mut all_time_best = f32::MAX;
+    let mut improve = false;
+
+    while n_not_improving_step < stop_after_step_not_improving {
+        n_iter += 1;
+
+        let current_fitness : f32 = {
+            let current_fitness = current_solution.fitness();
+            let next_fitness = strategy.next(&mut current_solution);
+            if rng.gen_range(0f32..=1f32) < f32::exp(-(next_fitness-current_fitness) / temperature) {
                 n_accept += 1;
-                current_fitness = next_fitness;
-                next_solution
+                next_fitness
             } else {
-                current_solution
-            };
-            
-            if n_accept >= decrease_threshold_on_accept || n_iter >= decrease_threshold_on_tried {
-                temperature *= cooling;
-                n_not_improving_step = if n_accept == 0 {n_not_improving_step + 1} else {0};
-                n_accept = 0;
-                n_iter = 0;
-                println!("Current fitness: {}\tTemperature: {}", current_fitness, temperature);
+                strategy.prev(&mut current_solution).unwrap()
             }
+        };
+
+        if best_fitness_step - current_fitness > best_fitness_step*0.001 {
+            best_fitness_step = current_fitness;
+            improve = true;
+            exporters.iter_mut().for_each(
+                |exporter| { exporter.export(&current_solution, ExportEvent::Init); });
         }
 
-        current_solution
-    }
+        if n_accept >= decrease_threshold_on_accept || n_iter >= decrease_threshold_on_tried {
+            temperature *= f32::from(cooling);
 
+            n_not_improving_step = if !improve {n_not_improving_step + 1} else {0};
+            n_accept = 0;
+            n_iter = 0;
+            improve = false;
 
-    fn full_compute_statistics(mut self) -> Self {
-        
-        let mut load_per_partition = vec![0.; self.n_part];
-        let mut ncut : usize = 0;
-        let mut cut_cost: f32 = 0.;
-        
-        for (ivertex, wvertex) in self.graph.vertex_weight.iter().enumerate() {
-            match self.vertex_partition[ivertex] {
-                Partition::Id(id) => {
-                    load_per_partition[id] += wvertex;
-                    for (ineighbor, neighbor_edge_weight) in self.graph.edge_weight[ivertex].iter().skip(ivertex).enumerate() {
-                        if neighbor_edge_weight > &0f32 && self.vertex_partition[ineighbor] == self.vertex_partition[ivertex] {
-                            ncut += 1;
-                            cut_cost += neighbor_edge_weight;
-                        }
-                    }
-                },
-                Partition::None => continue
-            }
+            println!("Best: {}\tCurrent fitness: {}\tTemperature: {}\t{}", best_fitness_step, current_fitness, temperature,n_not_improving_step);
+
+            all_time_best = all_time_best.min( current_fitness);
+            best_fitness_step = current_fitness;
         }
-
-        self.details.load_per_partition = load_per_partition;
-        self.details.ncut = ncut;
-        self.details.cut_cost = cut_cost;
-
-        self
     }
 
+    current_solution
 }
 
-fn export_as_csv(folder: &Path, partitioning: &Partitioning) -> std::io::Result<()> {
-    let mut fgraph = File::create(folder.join("vertices.data"))?;
-    let mut fpart  = File::create(folder.join("part.data"))?;
-    let g = partitioning.graph;
-    fgraph.write(b"#size\n")?;
-    fgraph.write(g.N.to_string().as_bytes())?;
-    fgraph.write("\n#vertices\n".as_bytes())?;
-    fgraph.write(g.vertex_weight.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(",").as_bytes())?;
-    fgraph.write("\n#adjacency\n".as_bytes())?;
-    for row in &g.adj {
-        fgraph.write(row.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(" ").as_bytes())?;
-        fgraph.write("\n".as_bytes())?;
-    }  
-    fgraph.write("#edges\n".as_bytes())?;
-    for row in &g.edge_weight {
-        fgraph.write(row.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(" ").as_bytes())?;
-        fgraph.write("\n".as_bytes())?;
-    }  
-    fpart.write(b"#size\n")?;
-    fpart.write(g.N.to_string().as_bytes())?;
-    fpart.write("\n#partitions\n".as_bytes())?;
-    fpart.write(partitioning.vertex_partition.iter().map(|x| match x  {
-        Partition::None => panic!("incomplete partition"),
-        Partition::Id(i) => i.to_string()
-    }).collect::<Vec<String>>().join(",").as_bytes())?;
-
-    Ok(())
+fn tsp_args() -> ArgMatches {
+    clap::Command::new("annealr")
+    .version("0.0.1")
+    .author("Anthony B. <shortab@pm.me>")
+    .about("Simulated annealing")
+    .arg(clap::arg!(--tsplib <FILE>))
+    .arg(clap::arg!(--ncities <N>).value_parser(clap::value_parser!(usize)))
+    .arg(clap::Arg::new("export-at-cooling").long("export-at-cooling").action(clap::ArgAction::SetTrue))
+    .arg(clap::Arg::new("export-at-iter").long("export-at-iter").action(clap::ArgAction::SetTrue))
+    .get_matches()
 }
 
-fn neighbor<'a>(part: &Partitioning<'a>) -> Partitioning<'a> {
-    let mut neighbor: Partitioning<'a> = part.clone();
-    neighbor.assign_partition(rand::thread_rng().gen_range(0..part.graph.N), Partition::Id(rand::thread_rng().gen_range(0..part.n_part)));
-    neighbor
+fn lb_args() -> ArgMatches {
+    clap::Command::new("annealr")
+    .version("0.0.1")
+    .author("Anthony B. <shortab@pm.me>")
+    .about("Simulated annealing")
+    .arg(clap::Arg::new("export-at-cooling").long("export-at-cooling").action(clap::ArgAction::SetTrue))
+    .arg(clap::Arg::new("export-at-iter").action(clap::ArgAction::SetTrue))
+    .get_matches()
 }
 
-fn fitness_functor (alpha:f32) -> impl Fn(&Partitioning) -> f32 {
-    move |part:&Partitioning| alpha * (1f32 + variance(&part.details.load_per_partition))
+fn tsp_run() {
+    let matches = tsp_args();
+
+    let export_pace = (if matches.get_flag("export-at-iter") {
+        ExportPace::AtIter
+    } else {
+        ExportPace::None
+    } as u8) | (if matches.get_flag("export-at-cooling") {
+        ExportPace::AtCooling
+    } else {
+        ExportPace::None
+    } as u8);
+
+    let ncities : usize = *matches.get_one::<usize>("ncities").expect("msg");
+
+    let tsp : TSPProblem = TSPProblem::new_random(ncities);
+    let s = TSPSolution::new_random(&tsp);
+    let mut strat : Swap<TwoOptSwap> = Swap::new();
+
+    save(&tsp, Path::new("cities.tsp")).unwrap();
+
+
+    let pace = ExportPace::try_from(export_pace).unwrap();
+
+    simulated_annealing(CoolingFactor::new(0.9f32).unwrap(), s,
+                        &mut strat,
+                        [FileExporter::new(Path::new("./tour.tsp"), pace).unwrap()].as_mut_slice());
+}
+
+fn lb_run() {
+    /*
+    let matches = lb_args();
+
+    let export_pace = if matches.get_flag("export-at-iter") {
+        ExportPace::EachIter
+    } else if matches.get_flag("export-at-cooling") {
+        ExportPace::EachCooling
+    } else {
+        ExportPace::None
+    };
+
+    let g = Graph::new_grid(25, 25, 1);
+
+    let s = Partitioning::new_random(4, &g);
+
+    simulated_annealing(0.95f32, s, export_pace);
+    */
 }
 
 fn main() {
-    let graph = Graph::new_randomized(100);
-    let part = Partitioning::new_simulated_annealing(4, &graph, 
-        0.9f32, 
-        neighbor,
-        fitness_functor(1.15f32));
-        
-    export_as_csv(Path::new("/tmp/"), &part).unwrap();
+    tsp_run();
 }
